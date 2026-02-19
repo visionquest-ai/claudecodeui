@@ -567,7 +567,21 @@ async function queryClaudeSDK(command, options = {}, ws) {
 
     // Process streaming messages
     console.log('Starting async generator loop for session:', capturedSessionId || 'NEW');
+
+    let messageCount = 0;
+    let lastMessageTime = Date.now();
+
     for await (const message of queryInstance) {
+      messageCount++;
+      const timeSinceLastMessage = Date.now() - lastMessageTime;
+      lastMessageTime = Date.now();
+
+      if (timeSinceLastMessage > 10000) {
+        console.log(`⚠️ Long gap between messages: ${timeSinceLastMessage}ms`);
+      }
+
+      console.log(`📨 Message #${messageCount}: type=${message.type || 'unknown'}`);
+
       // Capture session ID from first message
       if (message.session_id && !capturedSessionId) {
 
@@ -595,6 +609,14 @@ async function queryClaudeSDK(command, options = {}, ws) {
 
       // Transform and send message to WebSocket
       const transformedMessage = transformMessage(message);
+
+      // DEBUG: Log what we're sending
+      if (transformedMessage.type === 'content_block_delta') {
+        console.log('🔵 Sending content_block_delta:', transformedMessage.delta?.text?.substring(0, 50));
+      } else {
+        console.log('🔵 Sending message type:', transformedMessage.type);
+      }
+
       ws.send({
         type: 'claude-response',
         data: transformedMessage,
@@ -612,8 +634,35 @@ async function queryClaudeSDK(command, options = {}, ws) {
             sessionId: capturedSessionId || sessionId || null
           });
         }
+
+        // WORKAROUND: Force completion after result message
+        // The SDK sometimes doesn't send message_stop for cached responses
+        console.log('⚠️ Received result message - will force completion if no message_stop');
+        let completionSent = false;
+        setTimeout(() => {
+          if (!completionSent && (capturedSessionId || sessionId)) {
+            console.log('🔴 Timeout: no message_stop after result - forcing completion');
+            completionSent = true;
+
+            // Clean up session
+            if (capturedSessionId) {
+              removeSession(capturedSessionId);
+            }
+
+            // Send completion event
+            ws.send({
+              type: 'claude-complete',
+              sessionId: capturedSessionId,
+              exitCode: 0,
+              isNewSession: !sessionId && !!command
+            });
+            console.log('✅ Forced claude-complete sent');
+          }
+        }, 500); // Wait 500ms for message_stop
       }
     }
+
+    console.log(`✅ Async generator loop completed! Total messages: ${messageCount}`);
 
     // Clean up session on completion
     if (capturedSessionId) {

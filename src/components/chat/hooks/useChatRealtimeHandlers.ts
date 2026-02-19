@@ -43,6 +43,7 @@ interface UseChatRealtimeHandlersArgs {
   pendingViewSessionRef: MutableRefObject<PendingViewSession | null>;
   streamBufferRef: MutableRefObject<string>;
   streamTimerRef: MutableRefObject<number | null>;
+  isInThinkingBlockRef: MutableRefObject<boolean>;
   onSessionInactive?: (sessionId?: string | null) => void;
   onSessionProcessing?: (sessionId?: string | null) => void;
   onSessionNotProcessing?: (sessionId?: string | null) => void;
@@ -54,6 +55,7 @@ const appendStreamingChunk = (
   setChatMessages: Dispatch<SetStateAction<ChatMessage[]>>,
   chunk: string,
   newline = false,
+  isThinking = false,
 ) => {
   if (!chunk) {
     return;
@@ -63,7 +65,7 @@ const appendStreamingChunk = (
     const updated = [...previous];
     const lastIndex = updated.length - 1;
     const last = updated[lastIndex];
-    if (last && last.type === 'assistant' && !last.isToolUse && last.isStreaming) {
+    if (last && last.type === 'assistant' && !last.isToolUse && last.isStreaming && last.isThinking === isThinking) {
       const nextContent = newline
         ? last.content
           ? `${last.content}\n${chunk}`
@@ -72,7 +74,7 @@ const appendStreamingChunk = (
       // Clone the message instead of mutating in place so React can reliably detect state updates.
       updated[lastIndex] = { ...last, content: nextContent };
     } else {
-      updated.push({ type: 'assistant', content: chunk, timestamp: new Date(), isStreaming: true });
+      updated.push({ type: 'assistant', content: chunk, timestamp: new Date(), isStreaming: true, isThinking });
     }
     return updated;
   });
@@ -108,6 +110,7 @@ export function useChatRealtimeHandlers({
   pendingViewSessionRef,
   streamBufferRef,
   streamTimerRef,
+  isInThinkingBlockRef,
   onSessionInactive,
   onSessionProcessing,
   onSessionNotProcessing,
@@ -126,6 +129,9 @@ export function useChatRealtimeHandlers({
       return;
     }
     lastProcessedMessageRef.current = latestMessage;
+
+    // DEBUG: Log all incoming messages
+    console.log('🟢 Received message:', latestMessage.type, 'sessionId:', latestMessage.sessionId);
 
     const messageData = latestMessage.data?.message || latestMessage.data;
     const structuredMessageData =
@@ -178,12 +184,18 @@ export function useChatRealtimeHandlers({
         latestMessage.type === 'cursor-error' ||
         latestMessage.type === 'codex-error');
 
-    const handleBackgroundLifecycle = (sessionId?: string) => {
+    const handleBackgroundLifecycle = (sessionId?: string, isCurrentView = false) => {
       if (!sessionId) {
         return;
       }
       onSessionInactive?.(sessionId);
       onSessionNotProcessing?.(sessionId);
+
+      // If this is for the current view, also clear UI loading indicators
+      if (isCurrentView) {
+        console.log('🔄 Clearing UI indicators for current view session:', sessionId);
+        clearLoadingIndicators();
+      }
     };
 
     const collectSessionIds = (...sessionIds: Array<string | null | undefined>) =>
@@ -194,6 +206,7 @@ export function useChatRealtimeHandlers({
       );
 
     const clearLoadingIndicators = () => {
+      console.log('🔄 Clearing loading indicators');
       setIsLoading(false);
       setCanAbortSession(false);
       setClaudeStatus(null);
@@ -209,30 +222,43 @@ export function useChatRealtimeHandlers({
 
     if (!shouldBypassSessionFilter) {
       if (!activeViewSessionId) {
+        console.log('🔴 No activeViewSessionId, filtering message:', latestMessage.type, 'isLifecycle:', lifecycleMessageTypes.has(String(latestMessage.type)));
         if (latestMessage.sessionId && lifecycleMessageTypes.has(String(latestMessage.type))) {
-          handleBackgroundLifecycle(latestMessage.sessionId);
+          console.log('⚠️ Calling handleBackgroundLifecycle for:', latestMessage.type);
+          // Could be for pending session, so clear UI if it's a completion message
+          const isCompletionMessage = latestMessage.type === 'claude-complete' ||
+                                      latestMessage.type === 'codex-complete' ||
+                                      latestMessage.type === 'cursor-result';
+          handleBackgroundLifecycle(latestMessage.sessionId, isCompletionMessage);
         }
         if (!isUnscopedError) {
+          console.log('🚫 RETURNING - message filtered out!');
           return;
         }
       }
 
       if (!latestMessage.sessionId && !isUnscopedError) {
+        console.log('🔴 No sessionId in message, filtering:', latestMessage.type);
+        console.log('🚫 RETURNING - message filtered out!');
         return;
       }
 
       if (latestMessage.sessionId !== activeViewSessionId) {
         if (latestMessage.sessionId && lifecycleMessageTypes.has(String(latestMessage.type))) {
-          handleBackgroundLifecycle(latestMessage.sessionId);
+          console.log('⚠️ Calling handleBackgroundLifecycle for mismatched session:', latestMessage.type);
+          handleBackgroundLifecycle(latestMessage.sessionId, false);
         }
         console.log(
-          'Skipping message for different session:',
+          '🔴 Skipping message for different session:',
           latestMessage.sessionId,
           'current:',
           activeViewSessionId,
         );
+        console.log('🚫 RETURNING - message filtered out!');
         return;
       }
+    } else {
+      console.log('✅ Bypassing session filter for:', latestMessage.type);
     }
 
     switch (latestMessage.type) {
@@ -262,29 +288,56 @@ export function useChatRealtimeHandlers({
 
       case 'claude-response': {
         if (messageData && typeof messageData === 'object' && messageData.type) {
+          // Track when we enter a thinking block
+          if (messageData.type === 'content_block_start' && messageData.content_block?.type === 'thinking') {
+            console.log('🧠 Entering thinking block');
+            isInThinkingBlockRef.current = true;
+            return;
+          }
+
+          // Track when we exit a thinking block (or any block)
+          if (messageData.type === 'content_block_start' && messageData.content_block?.type === 'text') {
+            console.log('📝 Entering text block');
+            isInThinkingBlockRef.current = false;
+            return;
+          }
+
           if (messageData.type === 'content_block_delta' && messageData.delta?.text) {
             const decodedText = decodeHtmlEntities(messageData.delta.text);
+            const isThinking = isInThinkingBlockRef.current;
+            console.log(isThinking ? '🧠 thinking_delta:' : '🟣 content_block_delta:', decodedText.substring(0, 50));
             streamBufferRef.current += decodedText;
-            if (!streamTimerRef.current) {
-              streamTimerRef.current = window.setTimeout(() => {
-                const chunk = streamBufferRef.current;
-                streamBufferRef.current = '';
-                streamTimerRef.current = null;
-                appendStreamingChunk(setChatMessages, chunk, false);
-              }, 100);
+
+            // Clear existing timer to reset the debounce window
+            if (streamTimerRef.current) {
+              clearTimeout(streamTimerRef.current);
             }
+
+            // Set new timer with reduced delay for smoother streaming (16ms ≈ 1 frame @ 60fps)
+            streamTimerRef.current = window.setTimeout(() => {
+              const chunk = streamBufferRef.current;
+              streamBufferRef.current = '';
+              streamTimerRef.current = null;
+              appendStreamingChunk(setChatMessages, chunk, false, isThinking);
+            }, 16);
             return;
           }
 
           if (messageData.type === 'content_block_stop') {
+            console.log('🛑 content_block_stop - isThinking:', isInThinkingBlockRef.current);
             if (streamTimerRef.current) {
               clearTimeout(streamTimerRef.current);
               streamTimerRef.current = null;
             }
             const chunk = streamBufferRef.current;
             streamBufferRef.current = '';
-            appendStreamingChunk(setChatMessages, chunk, false);
+            const isThinking = isInThinkingBlockRef.current;
+            if (chunk) {
+              appendStreamingChunk(setChatMessages, chunk, false, isThinking);
+            }
             finalizeStreamingMessage(setChatMessages);
+            // Reset thinking flag after block stops
+            isInThinkingBlockRef.current = false;
             return;
           }
         }
@@ -483,14 +536,19 @@ export function useChatRealtimeHandlers({
         const cleaned = String(latestMessage.data || '');
         if (cleaned.trim()) {
           streamBufferRef.current += streamBufferRef.current ? `\n${cleaned}` : cleaned;
-          if (!streamTimerRef.current) {
-            streamTimerRef.current = window.setTimeout(() => {
-              const chunk = streamBufferRef.current;
-              streamBufferRef.current = '';
-              streamTimerRef.current = null;
-              appendStreamingChunk(setChatMessages, chunk, true);
-            }, 100);
+
+          // Clear existing timer to reset the debounce window
+          if (streamTimerRef.current) {
+            clearTimeout(streamTimerRef.current);
           }
+
+          // Set new timer with reduced delay for smoother streaming
+          streamTimerRef.current = window.setTimeout(() => {
+            const chunk = streamBufferRef.current;
+            streamBufferRef.current = '';
+            streamTimerRef.current = null;
+            appendStreamingChunk(setChatMessages, chunk, true);
+          }, 16);
         }
         break;
       }
@@ -702,14 +760,19 @@ export function useChatRealtimeHandlers({
 
           if (cleaned) {
             streamBufferRef.current += streamBufferRef.current ? `\n${cleaned}` : cleaned;
-            if (!streamTimerRef.current) {
-              streamTimerRef.current = window.setTimeout(() => {
-                const chunk = streamBufferRef.current;
-                streamBufferRef.current = '';
-                streamTimerRef.current = null;
-                appendStreamingChunk(setChatMessages, chunk, true);
-              }, 100);
+
+            // Clear existing timer to reset the debounce window
+            if (streamTimerRef.current) {
+              clearTimeout(streamTimerRef.current);
             }
+
+            // Set new timer with reduced delay for smoother streaming
+            streamTimerRef.current = window.setTimeout(() => {
+              const chunk = streamBufferRef.current;
+              streamBufferRef.current = '';
+              streamTimerRef.current = null;
+              appendStreamingChunk(setChatMessages, chunk, true);
+            }, 16);
           }
         } catch (error) {
           console.warn('Error handling cursor-output message:', error);
@@ -717,6 +780,7 @@ export function useChatRealtimeHandlers({
         break;
 
       case 'claude-complete': {
+        console.log('✅ claude-complete received - clearing loading state');
         const pendingSessionId = sessionStorage.getItem('pendingSessionId');
         const completedSessionId =
           latestMessage.sessionId || currentSessionId || pendingSessionId;

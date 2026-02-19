@@ -46,6 +46,7 @@ function ChatInterface({
   const streamBufferRef = useRef('');
   const streamTimerRef = useRef<number | null>(null);
   const pendingViewSessionRef = useRef<PendingViewSession | null>(null);
+  const isInThinkingBlockRef = useRef(false);
 
   const resetStreamingState = useCallback(() => {
     if (streamTimerRef.current) {
@@ -53,6 +54,7 @@ function ChatInterface({
       streamTimerRef.current = null;
     }
     streamBufferRef.current = '';
+    isInThinkingBlockRef.current = false;
   }, []);
 
   const {
@@ -211,6 +213,7 @@ function ChatInterface({
     pendingViewSessionRef,
     streamBufferRef,
     streamTimerRef,
+    isInThinkingBlockRef,
     onSessionInactive,
     onSessionProcessing,
     onSessionNotProcessing,
